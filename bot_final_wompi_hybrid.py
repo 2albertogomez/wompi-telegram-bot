@@ -1,5 +1,9 @@
-import os, csv
+import os
+import csv
+import logging
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
+
 import httpx
 from dotenv import load_dotenv
 
@@ -17,10 +21,12 @@ from apscheduler.triggers.date import DateTrigger
 from fastapi import FastAPI, Request
 import uvicorn
 
-# -------------------- Inicialización --------------------
+# ======================================================
+# CARGA DE ENTORNO
+# ======================================================
 load_dotenv()
 
-def must(name):
+def must(name: str) -> str:
     val = os.getenv(name)
     if not val:
         raise RuntimeError(f"Falta variable de entorno: {name}")
@@ -35,14 +41,30 @@ WOMPI_API_BASE = must("WOMPI_API_BASE")
 CHANNEL_ID = int(must("CHANNEL_ID"))
 EMAILS_NOTIFICACION = os.getenv("EMAILS_NOTIFICACION", "notificaciones@dummy.local")
 WEBHOOK_URL = must("WEBHOOK_URL")
+MODE = os.getenv("MODE", "render")
+PORT = int(os.getenv("PORT", 10000))
 
+# ======================================================
+# TIMEZONE
+# ======================================================
 try:
     from zoneinfo import ZoneInfo
     LOCAL_TZ = ZoneInfo("America/El_Salvador")
-except:
+except Exception:
     LOCAL_TZ = timezone(timedelta(hours=-6))
 
-# -------------------- Promociones --------------------
+# ======================================================
+# LOGGING
+# ======================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+)
+logger = logging.getLogger("wompi-bot")
+
+# ======================================================
+# PROMOCIONES
+# ======================================================
 CHAMPIONS_ENABLED = True
 
 SUBS = {
@@ -54,7 +76,9 @@ CODIGOS_PROMO = {
     "BRYAN22": 0.10,
 }
 
-# -------------------- CSV helpers --------------------
+# ======================================================
+# CSV MANAGER
+# ======================================================
 class CSVManager:
     def __init__(self, path, headers):
         self.path = path
@@ -63,24 +87,28 @@ class CSVManager:
             with open(self.path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(self.headers)
 
-    def append(self, row):
+    def append(self, row: dict):
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.headers).writerow(row)
 
 csv_links = CSVManager(
     "links.csv",
-    ["timestamp_utc","user_id","chat_id","username","referencia","idEnlace","urlEnlace","monto_usd"]
-)
-csv_valid = CSVManager(
-    "validaciones.csv",
-    ["timestamp_utc","user_id","referencia","idEnlace","estado"]
-)
-csv_subs = CSVManager(
-    "subs.csv",
-    ["user_id","tipo","expiracion_utc","estado"]
+    ["timestamp_utc", "user_id", "chat_id", "username", "referencia", "idEnlace", "urlEnlace", "monto_usd"]
 )
 
-# -------------------- Cliente Wompi --------------------
+csv_valid = CSVManager(
+    "validaciones.csv",
+    ["timestamp_utc", "user_id", "referencia", "idEnlace", "estado"]
+)
+
+csv_subs = CSVManager(
+    "subs.csv",
+    ["user_id", "tipo", "expiracion_utc", "estado"]
+)
+
+# ======================================================
+# WOMPI CLIENT
+# ======================================================
 class WompiClient:
     def __init__(self):
         self.token = None
@@ -138,27 +166,29 @@ class WompiClient:
 
 wompi = WompiClient()
 
-# -------------------- Scheduler --------------------
-scheduler = AsyncIOScheduler()
+# ======================================================
+# SCHEDULER
+# ======================================================
+scheduler = AsyncIOScheduler(timezone=LOCAL_TZ)
 
 class SubManager:
-    def __init__(self, app):
+    def __init__(self, app: Application):
         self.app = app
 
-    async def recordar(self, user_id):
+    async def recordar(self, user_id: int):
         await self.app.bot.send_message(
             user_id,
             "⚠️ Tu suscripción vence en 12 horas. Renueva para evitar suspensión."
         )
 
-    async def expirar(self, user_id):
+    async def expirar(self, user_id: int):
         await self.app.bot.ban_chat_member(CHANNEL_ID, user_id)
         await self.app.bot.send_message(
             user_id,
             "❌ Tu suscripción expiró. Has sido removido del canal."
         )
 
-    def programar(self, user_id, exp):
+    def programar(self, user_id: int, exp: datetime):
         scheduler.add_job(
             self.recordar,
             DateTrigger(run_date=exp - timedelta(hours=12)),
@@ -170,9 +200,12 @@ class SubManager:
             args=[user_id],
         )
 
-# -------------------- Handlers --------------------
+# ======================================================
+# TELEGRAM HANDLERS
+# ======================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = []
+
     if CHAMPIONS_ENABLED:
         kb.append([InlineKeyboardButton("💳 Mensual $30 (30 días)", callback_data="tipo_mensual")])
         kb.append([InlineKeyboardButton("⚽ Champions $10 (2 días)", callback_data="tipo_promo")])
@@ -184,31 +217,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
-# -------------------- App Telegram --------------------
+# ======================================================
+# TELEGRAM APPLICATION
+# ======================================================
 application = Application.builder().token(BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
+
 subm = SubManager(application)
 
-# -------------------- FastAPI --------------------
-fastapi_app = FastAPI()
+# ======================================================
+# FASTAPI + LIFESPAN (CLAVE PARA RENDER)
+# ======================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Inicializando Telegram Application...")
+    await application.initialize()
+    await application.start()
 
+    scheduler.start()
+
+    if MODE == "render":
+        logger.info("Configurando webhook...")
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        await application.bot.set_webhook(WEBHOOK_URL)
+
+    yield
+
+    logger.info("Cerrando aplicación...")
+    scheduler.shutdown()
+    await application.stop()
+    await application.shutdown()
+
+fastapi_app = FastAPI(lifespan=lifespan)
+
+# ======================================================
+# WEBHOOK
+# ======================================================
 @fastapi_app.post("/webhook")
-async def telegram_webhook(req: Request):
-    data = await req.json()
+async def telegram_webhook(request: Request):
+    data = await request.json()
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return {"ok": True}
 
-@fastapi_app.on_event("startup")
-async def startup():
-    scheduler.start()
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    await application.bot.set_webhook(WEBHOOK_URL)
+@fastapi_app.get("/")
+async def root():
+    return {"status": "ok", "service": "wompi-telegram-bot"}
 
-# -------------------- Ejecutar --------------------
+# ======================================================
+# MAIN
+# ======================================================
 if __name__ == "__main__":
     uvicorn.run(
         fastapi_app,
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 8080)),
+        port=PORT,
     )
