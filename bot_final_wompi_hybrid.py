@@ -1,3 +1,5 @@
+# bot_final_wompi_hybrid.py
+
 import os, csv, time, json, asyncio
 from datetime import datetime, timedelta, timezone
 import httpx
@@ -5,16 +7,17 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import nest_asyncio
 from fastapi import FastAPI, Request
 import uvicorn
 
+# -------------------- Config --------------------
+nest_asyncio.apply()
 load_dotenv()
 
-# -------------------- Configuración general --------------------
 def must(name):
     val = os.getenv(name)
-    if not val:
-        raise RuntimeError(f"Falta variable: {name}")
+    if not val: raise RuntimeError(f"Falta variable: {name}")
     return val
 
 BOT_TOKEN = must("BOT_TOKEN")
@@ -25,10 +28,10 @@ WOMPI_ID_URL = must("WOMPI_ID_URL")
 WOMPI_API_BASE = must("WOMPI_API_BASE")
 CHANNEL_ID = int(must("CHANNEL_ID"))
 EMAILS_NOTIFICACION = os.getenv("EMAILS_NOTIFICACION", "notificaciones@dummy.local")
-WEBHOOK_URL = must("WEBHOOK_URL")
-MODE = os.getenv("MODE", "local")  # local o render
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+MODE = os.getenv("MODE", "local")  # "local" o "render"
 
-CHAMPIONS_ENABLED = True  # Cambia a False para desactivar promoción Champions
+CHAMPIONS_ENABLED = True  # Cambiar a False para desactivar promoción Champions
 
 try:
     from zoneinfo import ZoneInfo
@@ -42,12 +45,9 @@ SUBS = {
     "mensual": {"nombre": "Suscripción completa (30 días)", "monto": 30.00, "dias": 30}
 }
 
-# -------------------- Códigos promocionales --------------------
 CODIGOS_PROMO = {
     "BRYAN22": 0.10,
     # "OFERTA20": 0.20,
-    # "VIP30": 0.30,
-    # "ALIADO40": 0.40,
 }
 
 # -------------------- CSV Helpers --------------------
@@ -79,7 +79,7 @@ csv_subs = CSVManager("subs.csv", ["user_id","tipo","expiracion_utc","estado"])
 csv_phones = CSVManager("telefonos.csv", ["timestamp_utc","user_id","phone"])
 csv_referidos = CSVManager("referidos.csv", ["timestamp_utc","user_id","codigo","creador","descuento"])
 
-# -------------------- Cliente Wompi --------------------
+# -------------------- Wompi Client --------------------
 class WompiClient:
     def __init__(self):
         self.token = None
@@ -123,7 +123,7 @@ class WompiClient:
 
 wompi = WompiClient()
 
-# -------------------- Suscripción y recordatorios --------------------
+# -------------------- Scheduler --------------------
 scheduler = AsyncIOScheduler()
 
 class SubManager:
@@ -136,7 +136,7 @@ class SubManager:
         scheduler.add_job(self.recordar, 'date', run_date=exp - timedelta(hours=12), args=[user_id])
         scheduler.add_job(self.expirar, 'date', run_date=exp, args=[user_id])
 
-# -------------------- Handlers de Telegram --------------------
+# -------------------- Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = []
     if CHAMPIONS_ENABLED:
@@ -159,7 +159,7 @@ async def seleccionar_tipo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["esperando_codigo"] = True
         await q.edit_message_text(
             f"Seleccionaste {SUBS[tipo]['nombre']} (${SUBS[tipo]['monto']}).\n"
-            "¿Tienes un código de descuento? Escribe el código (por ejemplo: BRYAN22), o escribe 'NO' si no tienes uno."
+            "¿Tienes un código de descuento? Escribe el código (por ejemplo: BRYAN10), o escribe 'NO' si no tienes uno."
         )
     else:
         kb = ReplyKeyboardMarkup([[KeyboardButton("📱 COMPARTIR NÚMERO", request_contact=True)]], resize_keyboard=True)
@@ -167,8 +167,7 @@ async def seleccionar_tipo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Pulsa el botón para compartir tu número:", reply_markup=kb)
 
 async def recibir_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("esperando_codigo"):
-        return
+    if not context.user_data.get("esperando_codigo"): return
     codigo = update.message.text.strip().upper()
     context.user_data["esperando_codigo"] = False
     context.user_data["codigo_promocional"] = codigo if codigo != "NO" else ""
@@ -191,13 +190,12 @@ async def recibir_contacto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             desc = CODIGOS_PROMO[codigo]
             monto_final = round(sub["monto"] * (1 - desc), 2)
             mensaje_descuento = f"✅ Código aplicado: {codigo} ({int(desc * 100)}% de descuento) — Nuevo monto: ${monto_final:.2f}\nApoyaste al aliado."
-            promo_creador = f"{codigo}_creador"
             csv_referidos.append({
                 "timestamp_utc": datetime.utcnow().isoformat(),
                 "user_id": update.effective_user.id,
                 "codigo": codigo,
-                "creador": promo_creador,
-                "descuento": int(desc * 100)
+                "creador": f"{codigo}_creador",
+                "descuento": int(desc*100)
             })
         elif codigo:
             mensaje_descuento = f"⚠️ Código {codigo} no válido. Se aplicará el precio normal (${monto_final:.2f})."
@@ -215,8 +213,7 @@ async def recibir_contacto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "monto_usd": monto_final
     })
     texto = f"💳 Enlace de pago:\n{data.get('urlEnlace') or data.get('url')}\n\nReferencia: {ref}\nMonto: ${monto_final:.2f}"
-    if mensaje_descuento:
-        texto = f"{mensaje_descuento}\n\n" + texto
+    if mensaje_descuento: texto = f"{mensaje_descuento}\n\n" + texto
     await update.message.reply_text(texto, reply_markup=ReplyKeyboardRemove())
 
 async def validar_pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -230,10 +227,8 @@ async def validar_pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dias = SUBS[tipo]["dias"]
         exp = datetime.now(timezone.utc) + timedelta(days=dias)
         csv_subs.append({"user_id": update.effective_user.id, "tipo": tipo, "expiracion_utc": exp.isoformat(), "estado": "activa"})
-        try:
-            await context.bot.unban_chat_member(CHANNEL_ID, update.effective_user.id)
-        except Exception:
-            pass
+        try: await context.bot.unban_chat_member(CHANNEL_ID, update.effective_user.id)
+        except: pass
         link = await context.bot.create_chat_invite_link(CHANNEL_ID, expire_date=datetime.now(timezone.utc)+timedelta(hours=1), member_limit=1)
         await update.message.reply_text(f"✅ Pago aprobado. Acceso válido hasta {exp.astimezone(LOCAL_TZ)}.\n\nLink (1h): {link.invite_link}")
         subm.programar(update.effective_user.id, exp)
@@ -241,7 +236,7 @@ async def validar_pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⌛ Aún pendiente. Intenta más tarde.")
 
 # -------------------- Crear bot --------------------
-def crear_bot():
+async def crear_bot():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("validar_pago", validar_pago))
@@ -250,25 +245,25 @@ def crear_bot():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_codigo))
     global subm
     subm = SubManager(app)
+    scheduler.start()
+    if MODE == "render" and WEBHOOK_URL:
+        await app.bot.set_webhook(url=WEBHOOK_URL)
     return app
 
-application = crear_bot()
-scheduler.start()
+# -------------------- Main --------------------
+if MODE == "local":
+    app = asyncio.run(crear_bot())
+    app.run_polling()
+else:
+    fastapi_app = FastAPI()
+    application = asyncio.run(crear_bot())
 
-# -------------------- FastAPI para Render --------------------
-fastapi_app = FastAPI()
+    @fastapi_app.post("/wompi/webhook")
+    async def webhook(req: Request):
+        data = await req.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return {"ok": True}
 
-@fastapi_app.on_event("startup")
-async def on_startup():
-    await application.bot.set_webhook(url=WEBHOOK_URL)
-
-@fastapi_app.post("/wompi/webhook")
-async def telegram_webhook(req: Request):
-    data = await req.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return {"ok": True}
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
+    if __name__ == "__main__":
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
