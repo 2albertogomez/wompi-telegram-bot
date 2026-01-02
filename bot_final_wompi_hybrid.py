@@ -1,9 +1,9 @@
-import os, csv, time
+import os, csv
 from datetime import datetime, timedelta, timezone
 import httpx
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 import asyncio
@@ -38,8 +38,8 @@ try:
 except:
     LOCAL_TZ = timezone(timedelta(hours=-6))
 
-# -------------------- Suscripciones y promociones --------------------
-CHAMPIONS_ENABLED = True  # Cambia a False para deshabilitar la promoción Champions
+# -------------------- Promociones --------------------
+CHAMPIONS_ENABLED = True
 
 SUBS = {
     "promo": {"nombre": "Promoción Champions League (2 días)", "monto": 10.00, "dias": 2},
@@ -48,8 +48,6 @@ SUBS = {
 
 CODIGOS_PROMO = {
     "BRYAN22": 0.10,
-    # "OFERTA20": 0.20,
-    # "VIP30": 0.30,
 }
 
 # -------------------- CSV helpers --------------------
@@ -152,17 +150,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     markup = InlineKeyboardMarkup(kb)
     await update.message.reply_text("👋 ¡Bienvenido! Selecciona tu plan:", reply_markup=markup)
 
-# Aquí irían los handlers de seleccionar_tipo, recibir_codigo, recibir_contacto, validar_pago
-# (Igual que en tu código original, lo omitimos por brevedad, se mantienen igual)
-
 # -------------------- Crear aplicación --------------------
 def crear_bot():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    # Agregar todos los demás handlers aquí
+    # Agrega tus otros handlers aquí
     global subm
     subm = SubManager(app)
-    scheduler.start()
     return app
 
 # -------------------- FastAPI para webhook --------------------
@@ -178,6 +172,8 @@ async def webhook(req: Request):
 
 @fastapi_app.on_event("startup")
 async def on_startup():
+    # Iniciar scheduler dentro del event loop
+    scheduler.start()
     if WEBHOOK_URL:
         await application.bot.delete_webhook()
         await application.bot.set_webhook(url=WEBHOOK_URL)
