@@ -1,32 +1,20 @@
-"""
-Bot de Telegram para promociones con Wompi (Versión Render/Webhook).
-Incluye:
-- /start, selección de promoción
-- Validación de pago
-- Recordatorios de expiración de suscripción
-- Baneo automático y desbaneo al pagar
-- Sistema de códigos de referidos/alianzas (10%..50%)
-"""
-
-import os, csv, time
+import os, csv, time, json, asyncio
 from datetime import datetime, timedelta, timezone
 import httpx
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.date import DateTrigger
 from fastapi import FastAPI, Request
 import uvicorn
-import nest_asyncio
 
-nest_asyncio.apply()
 load_dotenv()
 
 # -------------------- Configuración general --------------------
 def must(name):
     val = os.getenv(name)
-    if not val: raise RuntimeError(f"Falta variable: {name}")
+    if not val:
+        raise RuntimeError(f"Falta variable: {name}")
     return val
 
 BOT_TOKEN = must("BOT_TOKEN")
@@ -37,10 +25,10 @@ WOMPI_ID_URL = must("WOMPI_ID_URL")
 WOMPI_API_BASE = must("WOMPI_API_BASE")
 CHANNEL_ID = int(must("CHANNEL_ID"))
 EMAILS_NOTIFICACION = os.getenv("EMAILS_NOTIFICACION", "notificaciones@dummy.local")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-MODE = os.getenv("MODE", "webhook")  # Render siempre webhook
+WEBHOOK_URL = must("WEBHOOK_URL")
+MODE = os.getenv("MODE", "local")  # local o render
 
-CHAMPIONS_ENABLED = True  # True para habilitar la promo Champions
+CHAMPIONS_ENABLED = True  # Cambia a False para desactivar promoción Champions
 
 try:
     from zoneinfo import ZoneInfo
@@ -48,20 +36,21 @@ try:
 except:
     LOCAL_TZ = timezone(timedelta(hours=-6))
 
-# === Suscripciones ===
+# -------------------- Suscripciones --------------------
 SUBS = {
     "promo": {"nombre": "Promoción Champions League (2 días)", "monto": 10.00, "dias": 2},
     "mensual": {"nombre": "Suscripción completa (30 días)", "monto": 30.00, "dias": 30}
 }
 
-# === Códigos promocionales (solo mensual) ===
+# -------------------- Códigos promocionales --------------------
 CODIGOS_PROMO = {
     "BRYAN22": 0.10,
     # "OFERTA20": 0.20,
     # "VIP30": 0.30,
+    # "ALIADO40": 0.40,
 }
 
-# -------------------- CSV helpers --------------------
+# -------------------- CSV Helpers --------------------
 class CSVManager:
     def __init__(self, path, headers):
         self.path = path
@@ -69,11 +58,9 @@ class CSVManager:
         if not os.path.isfile(self.path):
             with open(self.path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(self.headers)
-
     def append(self, row):
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.headers).writerow(row)
-
     def get_today_rows(self, user_id):
         if not os.path.isfile(self.path): return []
         today = datetime.now(LOCAL_TZ).date()
@@ -96,7 +83,6 @@ csv_referidos = CSVManager("referidos.csv", ["timestamp_utc","user_id","codigo",
 class WompiClient:
     def __init__(self):
         self.token = None
-
     def _get_token(self):
         if not self.token:
             data = {
@@ -110,7 +96,6 @@ class WompiClient:
                 r.raise_for_status()
                 self.token = r.json()["access_token"]
         return self.token
-
     def crear_enlace(self, ref, monto, nombre):
         url = f"{WOMPI_API_BASE}/EnlacePago"
         payload = {"identificadorEnlaceComercio": ref, "monto": monto, "nombreProducto": nombre, "configuracion": {"emailsNotificacion": EMAILS_NOTIFICACION}}
@@ -118,14 +103,12 @@ class WompiClient:
             r = c.post(url, headers={"Authorization": f"Bearer {self._get_token()}", "Content-Type": "application/json"}, json=payload)
             r.raise_for_status()
             return r.json()
-
     def consultar(self, id_enlace):
         url = f"{WOMPI_API_BASE}/EnlacePago/{id_enlace}"
         with httpx.Client(timeout=30) as c:
             r = c.get(url, headers={"Authorization": f"Bearer {self._get_token()}", "Content-Type": "application/json"})
             r.raise_for_status()
             return r.json()
-
     @staticmethod
     def estado(enlace):
         for k in ["transaccion","ultimaTransaccion","transacciones"]:
@@ -140,23 +123,18 @@ class WompiClient:
 
 wompi = WompiClient()
 
-# -------------------- Suscripciones y recordatorios --------------------
+# -------------------- Suscripción y recordatorios --------------------
 scheduler = AsyncIOScheduler()
 
 class SubManager:
-    def __init__(self, app):
-        self.app = app
-
-    async def recordar(self, user_id):
-        await self.app.bot.send_message(user_id, "⚠️ Tu suscripción vence en 12h. Renueva para evitar suspensión.")
-
+    def __init__(self, app): self.app = app
+    async def recordar(self, user_id): await self.app.bot.send_message(user_id, "⚠️ Tu suscripción vence en 12h. Renueva para evitar suspensión.")
     async def expirar(self, user_id):
         await self.app.bot.ban_chat_member(CHANNEL_ID, user_id)
         await self.app.bot.send_message(user_id, "❌ Tu suscripción expiró. Has sido baneado. Paga para reactivarte.")
-
     def programar(self, user_id, exp):
-        scheduler.add_job(self.recordar, DateTrigger(run_date=exp - timedelta(hours=12)), args=[user_id])
-        scheduler.add_job(self.expirar, DateTrigger(run_date=exp), args=[user_id])
+        scheduler.add_job(self.recordar, 'date', run_date=exp - timedelta(hours=12), args=[user_id])
+        scheduler.add_job(self.expirar, 'date', run_date=exp, args=[user_id])
 
 # -------------------- Handlers de Telegram --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -166,42 +144,131 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb.append([InlineKeyboardButton("⚽ Champions $10 (2 días)", callback_data="tipo_promo")])
     else:
         kb.append([InlineKeyboardButton("💳 Mensual $30 (30 días)", callback_data="tipo_mensual")])
-
     markup = InlineKeyboardMarkup(kb)
     await update.message.reply_text("👋 ¡Bienvenido! Selecciona tu plan:", reply_markup=markup)
 
-# --- Copiar los demás handlers (seleccionar_tipo, recibir_codigo, recibir_contacto, validar_pago) directamente del código que me diste ---
-# No cambian, solo asegurarse que usan context.user_data y application.bot
+async def seleccionar_tipo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    tipo = q.data.split("_")[1]
+    if tipo == "promo" and not CHAMPIONS_ENABLED:
+        await q.edit_message_text("La promoción Champions no está disponible actualmente. Por favor elige Mensual.")
+        return
+    context.user_data["tipo"] = tipo
+    if tipo == "mensual":
+        context.user_data["esperando_codigo"] = True
+        await q.edit_message_text(
+            f"Seleccionaste {SUBS[tipo]['nombre']} (${SUBS[tipo]['monto']}).\n"
+            "¿Tienes un código de descuento? Escribe el código (por ejemplo: BRYAN22), o escribe 'NO' si no tienes uno."
+        )
+    else:
+        kb = ReplyKeyboardMarkup([[KeyboardButton("📱 COMPARTIR NÚMERO", request_contact=True)]], resize_keyboard=True)
+        await q.edit_message_text(f"Seleccionaste {SUBS[tipo]['nombre']} (${SUBS[tipo]['monto']}). Ahora comparte tu número.")
+        await q.message.reply_text("Pulsa el botón para compartir tu número:", reply_markup=kb)
 
-# -------------------- Setup del bot en modo webhook --------------------
+async def recibir_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("esperando_codigo"):
+        return
+    codigo = update.message.text.strip().upper()
+    context.user_data["esperando_codigo"] = False
+    context.user_data["codigo_promocional"] = codigo if codigo != "NO" else ""
+    kb = ReplyKeyboardMarkup([[KeyboardButton("📱 COMPARTIR NÚMERO", request_contact=True)]], resize_keyboard=True)
+    await update.message.reply_text("Perfecto 👍 Ahora comparte tu número para continuar.", reply_markup=kb)
+
+async def recibir_contacto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    c = update.effective_message.contact
+    if not c or c.user_id != update.effective_user.id:
+        return await update.message.reply_text("Comparte tu propio número.")
+    tipo = context.user_data.get("tipo")
+    if not tipo:
+        return await update.message.reply_text("Primero elige una suscripción con /start.")
+    sub = SUBS[tipo]
+    monto_final = sub["monto"]
+    mensaje_descuento = ""
+    if tipo == "mensual":
+        codigo = context.user_data.get("codigo_promocional", "").upper()
+        if codigo and codigo in CODIGOS_PROMO:
+            desc = CODIGOS_PROMO[codigo]
+            monto_final = round(sub["monto"] * (1 - desc), 2)
+            mensaje_descuento = f"✅ Código aplicado: {codigo} ({int(desc * 100)}% de descuento) — Nuevo monto: ${monto_final:.2f}\nApoyaste al aliado."
+            promo_creador = f"{codigo}_creador"
+            csv_referidos.append({
+                "timestamp_utc": datetime.utcnow().isoformat(),
+                "user_id": update.effective_user.id,
+                "codigo": codigo,
+                "creador": promo_creador,
+                "descuento": int(desc * 100)
+            })
+        elif codigo:
+            mensaje_descuento = f"⚠️ Código {codigo} no válido. Se aplicará el precio normal (${monto_final:.2f})."
+    csv_phones.append({"timestamp_utc": datetime.utcnow().isoformat(), "user_id": update.effective_user.id, "phone": c.phone_number})
+    ref = f"tg_{update.effective_user.id}_{int(time.time())}"
+    data = wompi.crear_enlace(ref, monto_final, sub["nombre"])
+    csv_links.append({
+        "timestamp_utc": datetime.utcnow().isoformat(),
+        "user_id": update.effective_user.id,
+        "chat_id": update.effective_chat.id,
+        "username": update.effective_user.username or "sin",
+        "referencia": ref,
+        "idEnlace": data.get("idEnlace") or data.get("id"),
+        "urlEnlace": data.get("urlEnlace") or data.get("url"),
+        "monto_usd": monto_final
+    })
+    texto = f"💳 Enlace de pago:\n{data.get('urlEnlace') or data.get('url')}\n\nReferencia: {ref}\nMonto: ${monto_final:.2f}"
+    if mensaje_descuento:
+        texto = f"{mensaje_descuento}\n\n" + texto
+    await update.message.reply_text(texto, reply_markup=ReplyKeyboardRemove())
+
+async def validar_pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = csv_links.get_today_rows(update.effective_user.id)
+    if not rows: return await update.message.reply_text("No hay pagos recientes. Usa /start para crear uno.")
+    reg = rows[-1]
+    data = wompi.consultar(int(reg["idEnlace"]))
+    estado = wompi.estado(data)
+    if estado == "aprobada":
+        tipo = "promo" if "promo" in reg["referencia"] else "mensual"
+        dias = SUBS[tipo]["dias"]
+        exp = datetime.now(timezone.utc) + timedelta(days=dias)
+        csv_subs.append({"user_id": update.effective_user.id, "tipo": tipo, "expiracion_utc": exp.isoformat(), "estado": "activa"})
+        try:
+            await context.bot.unban_chat_member(CHANNEL_ID, update.effective_user.id)
+        except Exception:
+            pass
+        link = await context.bot.create_chat_invite_link(CHANNEL_ID, expire_date=datetime.now(timezone.utc)+timedelta(hours=1), member_limit=1)
+        await update.message.reply_text(f"✅ Pago aprobado. Acceso válido hasta {exp.astimezone(LOCAL_TZ)}.\n\nLink (1h): {link.invite_link}")
+        subm.programar(update.effective_user.id, exp)
+    else:
+        await update.message.reply_text("⌛ Aún pendiente. Intenta más tarde.")
+
+# -------------------- Crear bot --------------------
 def crear_bot():
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    # Agregar los demás handlers
-    # app.add_handler(CallbackQueryHandler(...))
-    # app.add_handler(MessageHandler(...))
-
+    app.add_handler(CommandHandler("validar_pago", validar_pago))
+    app.add_handler(CallbackQueryHandler(seleccionar_tipo, pattern="^tipo_"))
+    app.add_handler(MessageHandler(filters.CONTACT, recibir_contacto))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_codigo))
     global subm
     subm = SubManager(app)
-    scheduler.start()
     return app
 
-fastapi_app = FastAPI()
 application = crear_bot()
+scheduler.start()
 
-@fastapi_app.post("/webhook")
-async def webhook(req: Request):
+# -------------------- FastAPI para Render --------------------
+fastapi_app = FastAPI()
+
+@fastapi_app.on_event("startup")
+async def on_startup():
+    await application.bot.set_webhook(url=WEBHOOK_URL)
+
+@fastapi_app.post("/wompi/webhook")
+async def telegram_webhook(req: Request):
     data = await req.json()
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return {"ok": True}
 
-@fastapi_app.on_event("startup")
-async def on_startup():
-    await application.initialize()  # Crucial
-    if WEBHOOK_URL:
-        await application.bot.set_webhook(url=WEBHOOK_URL)
-
 if __name__ == "__main__":
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
