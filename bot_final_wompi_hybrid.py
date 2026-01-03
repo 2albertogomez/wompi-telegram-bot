@@ -1,20 +1,16 @@
-import os, csv, logging
+import os
+import csv
 from datetime import datetime, timedelta, timezone
+
 import httpx
 from dotenv import load_dotenv
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -23,300 +19,303 @@ from apscheduler.triggers.date import DateTrigger
 from fastapi import FastAPI, Request
 import uvicorn
 
-# -------------------------------------------------
-# LOGGING
-# -------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-)
-log = logging.getLogger("wompi-bot")
-
-# -------------------------------------------------
-# ENV
-# -------------------------------------------------
+# ======================================================
+# INICIALIZACIÓN
+# ======================================================
 load_dotenv()
 
-def must(name):
-    v = os.getenv(name)
-    if not v:
+def must(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
         raise RuntimeError(f"Falta variable de entorno: {name}")
-    return v
+    return val
 
 BOT_TOKEN = must("BOT_TOKEN")
 WOMPI_CLIENT_ID = must("WOMPI_CLIENT_ID")
 WOMPI_CLIENT_SECRET = must("WOMPI_CLIENT_SECRET")
+WOMPI_AUDIENCE = os.getenv("WOMPI_AUDIENCE", "wompi_api")
 WOMPI_ID_URL = must("WOMPI_ID_URL")
 WOMPI_API_BASE = must("WOMPI_API_BASE")
-WEBHOOK_URL = must("WEBHOOK_URL")
 CHANNEL_ID = int(must("CHANNEL_ID"))
+WEBHOOK_URL = must("WEBHOOK_URL")
 EMAILS_NOTIFICACION = os.getenv("EMAILS_NOTIFICACION", "notificaciones@dummy.local")
 
-# -------------------------------------------------
-# TIMEZONE
-# -------------------------------------------------
 try:
     from zoneinfo import ZoneInfo
     LOCAL_TZ = ZoneInfo("America/El_Salvador")
-except:
+except Exception:
     LOCAL_TZ = timezone(timedelta(hours=-6))
 
-# -------------------------------------------------
-# PLANES
-# -------------------------------------------------
+# ======================================================
+# PROMOCIONES
+# ======================================================
+CHAMPIONS_ENABLED = True
+
 SUBS = {
-    "mensual": {"nombre": "Suscripción Mensual (30 días)", "monto": 30.00, "dias": 30},
-    "promo": {"nombre": "Promoción Champions (2 días)", "monto": 10.00, "dias": 2},
+    "promo": {
+        "nombre": "Promoción Champions League (2 días)",
+        "monto": 10.00,
+        "dias": 2,
+    },
+    "mensual": {
+        "nombre": "Suscripción completa (30 días)",
+        "monto": 30.00,
+        "dias": 30,
+    },
 }
 
-# -------------------------------------------------
-# CÓDIGOS PROMOCIONALES
-# SOLO APLICAN AL PLAN MENSUAL
-# -------------------------------------------------
 CODIGOS_PROMO = {
-    "BRYAN22": 0.99,  # 10%
+    "BRYAN22": 0.95,
 }
 
-# -------------------------------------------------
-# CSV
-# -------------------------------------------------
-def csv_append(path, headers, row):
-    exists = os.path.isfile(path)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
-        if not exists:
-            w.writeheader()
-        w.writerow(row)
+# ======================================================
+# CSV HELPERS
+# ======================================================
+class CSVManager:
+    def __init__(self, path, headers):
+        self.path = path
+        self.headers = headers
+        if not os.path.isfile(self.path):
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(self.headers)
 
-# -------------------------------------------------
-# WOMPI
-# -------------------------------------------------
+    def append(self, row: dict):
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=self.headers).writerow(row)
+
+csv_links = CSVManager(
+    "links.csv",
+    [
+        "timestamp_utc",
+        "user_id",
+        "chat_id",
+        "username",
+        "referencia",
+        "idEnlace",
+        "urlEnlace",
+        "monto_usd",
+    ],
+)
+
+csv_subs = CSVManager(
+    "subs.csv",
+    ["user_id", "tipo", "expiracion_utc", "estado"],
+)
+
+# ======================================================
+# CLIENTE WOMPI
+# ======================================================
 class WompiClient:
     def __init__(self):
         self.token = None
 
-    def token_ok(self):
-        if self.token:
-            return self.token
-
-        data = {
-            "grant_type": "client_credentials",
-            "client_id": WOMPI_CLIENT_ID,
-            "client_secret": WOMPI_CLIENT_SECRET,
-            "audience": "wompi_api",
-        }
-
-        r = httpx.post(WOMPI_ID_URL, data=data, timeout=30)
-        r.raise_for_status()
-        self.token = r.json()["access_token"]
+    def _get_token(self):
+        if not self.token:
+            data = {
+                "grant_type": "client_credentials",
+                "client_id": WOMPI_CLIENT_ID,
+                "client_secret": WOMPI_CLIENT_SECRET,
+                "audience": WOMPI_AUDIENCE,
+            }
+            with httpx.Client(timeout=30) as c:
+                r = c.post(
+                    WOMPI_ID_URL,
+                    data=data,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+                r.raise_for_status()
+                self.token = r.json()["access_token"]
         return self.token
 
-    def crear_enlace(self, ref, monto, nombre):
-        r = httpx.post(
-            f"{WOMPI_API_BASE}/EnlacePago",
-            headers={
-                "Authorization": f"Bearer {self.token_ok()}",
-                "Content-Type": "application/json",
+    def crear_enlace(self, referencia, monto, nombre):
+        url = f"{WOMPI_API_BASE}/EnlacePago"
+        payload = {
+            "identificadorEnlaceComercio": referencia,
+            "monto": monto,
+            "nombreProducto": nombre,
+            "configuracion": {
+                "emailsNotificacion": EMAILS_NOTIFICACION
             },
-            json={
-                "identificadorEnlaceComercio": ref,
-                "monto": monto,
-                "nombreProducto": nombre,
-                "configuracion": {
-                    "emailsNotificacion": EMAILS_NOTIFICACION
+        }
+        with httpx.Client(timeout=30) as c:
+            r = c.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self._get_token()}",
+                    "Content-Type": "application/json",
                 },
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def consultar(self, id_enlace):
-        r = httpx.get(
-            f"{WOMPI_API_BASE}/EnlacePago/{id_enlace}",
-            headers={"Authorization": f"Bearer {self.token_ok()}"},
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()
+                json=payload,
+            )
+            r.raise_for_status()
+            return r.json()
 
 wompi = WompiClient()
 
-# -------------------------------------------------
+# ======================================================
+# UTILIDADES
+# ======================================================
+def get_user_from_update(update: Update):
+    if update.message and update.message.from_user:
+        return update.message.from_user
+    if update.callback_query and update.callback_query.from_user:
+        return update.callback_query.from_user
+    return None
+
+# ======================================================
 # SCHEDULER
-# -------------------------------------------------
+# ======================================================
 scheduler = AsyncIOScheduler()
 
-async def recordar(app, user_id):
-    await app.bot.send_message(
-        user_id,
-        "⚠️ Tu suscripción vence en 12 horas. Renueva para no perder acceso."
-    )
+class SubManager:
+    def __init__(self, app: Application):
+        self.app = app
 
-async def expirar(app, user_id):
-    await app.bot.ban_chat_member(CHANNEL_ID, user_id)
-    await app.bot.send_message(
-        user_id,
-        "❌ Tu suscripción expiró. Has sido removido del canal."
-    )
+    async def recordar(self, user_id: int):
+        await self.app.bot.send_message(
+            user_id,
+            "⚠️ Tu suscripción vence en 12 horas. Renueva para evitar suspensión.",
+        )
 
-# -------------------------------------------------
-# TELEGRAM APP
-# -------------------------------------------------
-application = Application.builder().token(BOT_TOKEN).build()
+    async def expirar(self, user_id: int):
+        await self.app.bot.ban_chat_member(CHANNEL_ID, user_id)
+        await self.app.bot.send_message(
+            user_id,
+            "❌ Tu suscripción expiró. Has sido removido del canal.",
+        )
 
-# -------------------------------------------------
-# HANDLERS
-# -------------------------------------------------
+    def programar(self, user_id: int, exp: datetime):
+        scheduler.add_job(
+            self.recordar,
+            DateTrigger(run_date=exp - timedelta(hours=12)),
+            args=[user_id],
+        )
+        scheduler.add_job(
+            self.expirar,
+            DateTrigger(run_date=exp),
+            args=[user_id],
+        )
+
+# ======================================================
+# HANDLERS TELEGRAM
+# ======================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("💳 Mensual $30 (30 días)", callback_data="plan_mensual")],
-        [InlineKeyboardButton("⚽ Promo $10 (2 días)", callback_data="plan_promo")],
-    ]
+    kb = []
+
+    kb.append(
+        [InlineKeyboardButton("💳 Mensual $30 (30 días)", callback_data="plan_mensual")]
+    )
+
+    if CHAMPIONS_ENABLED:
+        kb.append(
+            [InlineKeyboardButton("⚽ Champions $10 (2 días)", callback_data="plan_promo")]
+        )
+
     await update.message.reply_text(
-        "👋 Bienvenido\n\nSelecciona tu plan:",
+        "👋 Bienvenido. Selecciona tu plan:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
-async def elegir_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def seleccionar_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    plan = q.data.replace("plan_", "")
-    context.user_data.clear()
+    plan = query.data.replace("plan_", "")
     context.user_data["plan"] = plan
 
-    if plan == "mensual":
-        kb = [
-            [InlineKeyboardButton("✅ Sí", callback_data="codigo_si")],
-            [InlineKeyboardButton("❌ No", callback_data="codigo_no")],
-        ]
-        await q.message.reply_text(
-            "¿Tienes código promocional?",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-    else:
-        await generar_pago(q, context, descuento=0)
-
-async def sin_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await generar_pago(q, context, descuento=0)
-
-async def pedir_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    context.user_data["esperando_codigo"] = True
-    await q.message.reply_text("✍️ Escribe tu código promocional:")
+    await query.message.reply_text(
+        "✉️ Si tienes código promocional escríbelo ahora.\n"
+        "Si no, escribe *NO*.",
+        parse_mode="Markdown",
+    )
 
 async def recibir_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("esperando_codigo"):
-        return
+    texto = update.message.text.strip().upper()
 
-    codigo = update.message.text.strip().upper()
-    context.user_data["esperando_codigo"] = False
-
-    descuento = CODIGOS_PROMO.get(codigo)
-    if not descuento:
-        await update.message.reply_text("❌ Código inválido.")
-        descuento = 0
-    else:
-        await update.message.reply_text(
-            f"✅ Código aplicado: {int(descuento*100)}% descuento"
-        )
-
+    descuento = CODIGOS_PROMO.get(texto, 0.0)
     await generar_pago(update, context, descuento)
 
-async def generar_pago(source, context, descuento):
-    plan = context.user_data["plan"]
-    sub = SUBS[plan]
-
-    monto = round(sub["monto"] * (1 - descuento), 2)
-    ref = f"{plan}_{source.from_user.id}_{int(datetime.now().timestamp())}"
-
-    data = wompi.crear_enlace(ref, monto, sub["nombre"])
-
-    csv_append(
-        "links.csv",
-        ["timestamp","user","plan","monto","id","url"],
-        {
-            "timestamp": datetime.utcnow().isoformat(),
-            "user": source.from_user.id,
-            "plan": plan,
-            "monto": monto,
-            "id": data["idEnlace"],
-            "url": data["urlEnlace"],
-        },
-    )
-
-    await source.message.reply_text(
-        f"💳 Total a pagar: ${monto:.2f}\n\n{data['urlEnlace']}",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Ya pagué", callback_data=f"verificar_{data['idEnlace']}")]
-        ])
-    )
-
-async def verificar_pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    id_enlace = q.data.replace("verificar_", "")
-    data = wompi.consultar(id_enlace)
-
-    if data.get("estado") != "PAGADO":
-        await q.message.reply_text("⏳ Pago aún no confirmado.")
+async def generar_pago(update: Update, context: ContextTypes.DEFAULT_TYPE, descuento=0.0):
+    user = get_user_from_update(update)
+    if not user:
         return
 
-    plan = context.user_data["plan"]
-    dias = SUBS[plan]["dias"]
-    user_id = q.from_user.id
+    plan = context.user_data.get("plan")
+    if plan not in SUBS:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ Plan inválido.",
+        )
+        return
 
-    await application.bot.unban_chat_member(CHANNEL_ID, user_id)
-    await application.bot.send_message(user_id, "✅ Pago confirmado. Acceso habilitado.")
+    sub = SUBS[plan]
+    monto = sub["monto"]
 
-    exp = datetime.now(LOCAL_TZ) + timedelta(days=dias)
+    if descuento > 0:
+        monto = round(monto * (1 - descuento), 2)
 
-    scheduler.add_job(recordar, DateTrigger(exp - timedelta(hours=12)), args=[application, user_id])
-    scheduler.add_job(expirar, DateTrigger(exp), args=[application, user_id])
+    referencia = f"{plan}_{user.id}_{int(datetime.utcnow().timestamp())}"
 
-# -------------------------------------------------
-# REGISTRO HANDLERS
-# -------------------------------------------------
+    enlace = wompi.crear_enlace(referencia, monto, sub["nombre"])
+    url_pago = enlace.get("urlEnlace") or enlace.get("url")
+
+    csv_links.append({
+        "timestamp_utc": datetime.utcnow().isoformat(),
+        "user_id": user.id,
+        "chat_id": update.effective_chat.id,
+        "username": user.username or "",
+        "referencia": referencia,
+        "idEnlace": enlace.get("idEnlace", ""),
+        "urlEnlace": url_pago,
+        "monto_usd": monto,
+    })
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"💳 Para completar tu pago ingresa aquí:\n\n{url_pago}",
+    )
+
+# ======================================================
+# ERROR HANDLER
+# ======================================================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print("ERROR:", context.error)
+
+# ======================================================
+# APLICACIÓN TELEGRAM
+# ======================================================
+application = Application.builder().token(BOT_TOKEN).build()
+
 application.add_handler(CommandHandler("start", start))
-application.add_handler(CallbackQueryHandler(elegir_plan, pattern="^plan_"))
-application.add_handler(CallbackQueryHandler(sin_codigo, pattern="^codigo_no$"))
-application.add_handler(CallbackQueryHandler(pedir_codigo, pattern="^codigo_si$"))
-application.add_handler(CallbackQueryHandler(verificar_pago, pattern="^verificar_"))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_codigo))
+application.add_handler(CallbackQueryHandler(seleccionar_plan, pattern="^plan_"))
+application.add_handler(CommandHandler("codigo", recibir_codigo))
+application.add_error_handler(error_handler)
 
-# -------------------------------------------------
+subm = SubManager(application)
+
+# ======================================================
 # FASTAPI
-# -------------------------------------------------
-app = FastAPI()
+# ======================================================
+fastapi_app = FastAPI()
 
-@app.post("/webhook")
-async def webhook(req: Request):
+@fastapi_app.post("/webhook")
+async def telegram_webhook(req: Request):
     data = await req.json()
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return {"ok": True}
 
-@app.on_event("startup")
-async def startup():
-    log.info("Inicializando Telegram Application...")
-    await application.initialize()
-    await application.start()
+@fastapi_app.on_event("startup")
+async def on_startup():
     scheduler.start()
+    await application.bot.delete_webhook(drop_pending_updates=True)
     await application.bot.set_webhook(WEBHOOK_URL)
 
-@app.on_event("shutdown")
-async def shutdown():
-    log.info("Cerrando aplicación...")
-    scheduler.shutdown()
-    await application.stop()
-
-# -------------------------------------------------
-# RUN
-# -------------------------------------------------
+# ======================================================
+# EJECUCIÓN
+# ======================================================
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    uvicorn.run(
+        fastapi_app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+    )
